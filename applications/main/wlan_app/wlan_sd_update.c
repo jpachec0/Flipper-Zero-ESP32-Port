@@ -2,6 +2,7 @@
 
 #include <furi.h>
 #include <storage/storage.h>
+#include <internal_ext_fallback.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -11,7 +12,6 @@
 #include <esp_heap_caps.h>
 
 #define SD_UPDATE_TAG "WlanSdUpdate"
-// sdcard/-Ordner wird unter dieser Basis gespiegelt veröffentlicht.
 #define SD_UPDATE_BASE_URL "https://sor3nt.github.io/release/t-embed/latest"
 #define SD_UPDATE_VERSION_URL SD_UPDATE_BASE_URL "/version.txt"
 #define SD_UPDATE_FILES_URL SD_UPDATE_BASE_URL "/files.txt"
@@ -20,8 +20,9 @@
 #define SD_UPDATE_MAX_MANIFEST (4u * 1024u * 1024u)
 #define SD_UPDATE_CHUNK 8192
 #define SD_UPDATE_LOCAL_MANIFEST "/ext/files.txt"
-// Anzahl Versuche pro Datei bei Read-Timeout/Verbindungsabbruch. Jeder Retry
-// setzt per HTTP-Range an der bereits geschriebenen Byte-Position fort.
+#define SD_UPDATE_INTERNAL_PROFILE_MARKER "/ext/.internal_profile"
+#define SD_UPDATE_INTERNAL_RESERVE (256u * 1024u)
+#define SD_UPDATE_INTERNAL_CLUSTER 4096u
 #define SD_UPDATE_MAX_RETRY 4
 
 static void* sd_malloc(size_t n) {
@@ -38,6 +39,8 @@ struct WlanSdUpdate {
     volatile uint32_t speed_kbps;
     volatile uint32_t done_files;
     volatile uint32_t total_files;
+    bool internal_profile;
+    bool internal_compact;
     char current_file[64];
     char err[64];
 };
@@ -54,7 +57,6 @@ static void sd_update_fail(WlanSdUpdate* u, const char* msg) {
     FURI_LOG_E(SD_UPDATE_TAG, "%s", msg);
 }
 
-// Schneidet führende/abschließende Whitespaces (inkl. \r\n) in-place ab.
 static void sd_update_trim(char* s) {
     size_t n = strlen(s);
     while(n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' ||
@@ -74,19 +76,14 @@ static void sd_update_http_cfg(esp_http_client_config_t* cfg, const char* url) {
     cfg->url = url;
     cfg->timeout_ms = 40000;
     cfg->transport_type = HTTP_TRANSPORT_OVER_SSL;
-    // SSL-Verifikation deaktiviert (kein CA gesetzt; benötigt
-    // CONFIG_ESP_TLS_INSECURE / SKIP_SERVER_CERT_VERIFY).
     cfg->skip_cert_common_name_check = true;
     cfg->crt_bundle_attach = NULL;
     cfg->use_global_ca_store = false;
     cfg->buffer_size = SD_UPDATE_CHUNK;
     cfg->buffer_size_tx = 1024;
-    // Verbindung/TLS-Session über mehrere Dateien wiederverwenden, sonst
-    // zahlt jede Datei einen kompletten TLS-Handshake (sehr langsam).
     cfg->keep_alive_enable = true;
 }
 
-// Lädt eine kleine Text-Resource synchron in out (nul-terminiert).
 static bool sd_update_http_get_text(const char* url, char* out, size_t out_sz) {
     esp_http_client_config_t cfg;
     sd_update_http_cfg(&cfg, url);
@@ -116,7 +113,6 @@ static bool sd_update_http_get_text(const char* url, char* out, size_t out_sz) {
     return ok;
 }
 
-// Lädt das (Text-)Manifest in einen malloc-Puffer. Caller frees.
 static char* sd_update_http_get_alloc(const char* url, size_t* out_len) {
     esp_http_client_config_t cfg;
     sd_update_http_cfg(&cfg, url);
@@ -183,22 +179,16 @@ static bool sd_update_read_local_version(char* out, size_t out_sz) {
     return ok;
 }
 
-// true → lokale version.txt existiert und ist identisch mit der Remote-Version.
 static bool sd_update_is_up_to_date(void) {
     char remote[64];
     char local[64];
-    if(!sd_update_http_get_text(SD_UPDATE_VERSION_URL, remote, sizeof(remote))) {
-        return false;
-    }
-    if(!sd_update_read_local_version(local, sizeof(local))) {
-        return false;
-    }
+    if(!sd_update_http_get_text(SD_UPDATE_VERSION_URL, remote, sizeof(remote))) return false;
+    if(!sd_update_read_local_version(local, sizeof(local))) return false;
     sd_update_trim(remote);
     sd_update_trim(local);
     return remote[0] != '\0' && strcmp(remote, local) == 0;
 }
 
-// Legt /ext/a/b rekursiv an (ohne den finalen Dateinamen).
 static void sd_update_mkdirs(Storage* storage, const char* path) {
     char tmp[256];
     strncpy(tmp, path, sizeof(tmp) - 1);
@@ -212,12 +202,6 @@ static void sd_update_mkdirs(Storage* storage, const char* path) {
     }
 }
 
-// Ein einzelner Download-Versuch über den (wiederverwendeten) Client.
-//   *resume_from: bereits lokal vorhandene Bytes; wird per HTTP-Range
-//                 fortgesetzt und auf den neuen Stand mitgeführt.
-//   *complete:    true, wenn der Stream vollständig bis zum Ende gelesen wurde.
-// Rückgabe true nur bei vollständigem Empfang; bei Read-Timeout/Abbruch false,
-// wobei *resume_from den letzten geschriebenen Stand behält (für den Retry).
 static bool sd_update_download_attempt(
     WlanSdUpdate* u,
     esp_http_client_handle_t client,
@@ -234,7 +218,6 @@ static bool sd_update_download_attempt(
         snprintf(range, sizeof(range), "bytes=%lu-", (unsigned long)*resume_from);
         esp_http_client_set_header(client, "Range", range);
     } else {
-        // Stale Range-Header vom vorherigen Versuch am Reuse-Client entfernen.
         esp_http_client_delete_header(client, "Range");
     }
 
@@ -247,8 +230,6 @@ static bool sd_update_download_attempt(
     do {
         esp_http_client_fetch_headers(client);
         int status = esp_http_client_get_status_code(client);
-        // 206 = Server akzeptiert Range (Resume). 200 = voller Inhalt — auch
-        // wenn wir Range gefordert haben (Server ignoriert es) → von vorn.
         bool resumed = (status == 206);
         if(status != 200 && status != 206) break;
         if(*resume_from > 0 && !resumed) *resume_from = 0;
@@ -266,12 +247,12 @@ static bool sd_update_download_attempt(
 
         ok = true;
         uint32_t t0 = furi_get_tick();
-        uint32_t total = *resume_from; // gesamt (für Resume-Offset)
-        uint32_t session = 0;          // nur dieser Versuch (für Speed)
+        uint32_t total = *resume_from;
+        uint32_t session = 0;
         while(!u->cancel) {
             int r = esp_http_client_read(client, (char*)chunk, SD_UPDATE_CHUNK);
             if(r < 0) {
-                ok = false; // Timeout/Reset → Versuch gescheitert, Retry folgt
+                ok = false;
                 break;
             }
             if(r == 0) {
@@ -303,9 +284,6 @@ static bool sd_update_download_attempt(
     return ok && *complete;
 }
 
-// Lädt eine Einzeldatei nach dest, mit bis zu SD_UPDATE_MAX_RETRY Versuchen.
-// Bei Read-Timeout/Verbindungsabbruch wird per HTTP-Range an der bereits
-// geschriebenen Position fortgesetzt (kein kompletter Neu-Download).
 static bool sd_update_download_file(
     WlanSdUpdate* u,
     esp_http_client_handle_t client,
@@ -337,7 +315,6 @@ static bool sd_update_download_file(
     return false;
 }
 
-// Path-Traversal-Schutz; baut /ext/<rel>.
 static bool sd_update_safe_dest(const char* rel, char* out, size_t out_sz) {
     while(*rel == '/') rel++;
     if(!*rel) return false;
@@ -353,14 +330,11 @@ static uint32_t sd_update_count_lines(const char* s) {
     return n ? n : 1;
 }
 
-// Ein Manifest-Eintrag (Zeiger zeigen in den jeweiligen Puffer).
 typedef struct {
-    const char* path; // nul-terminiert
-    const char* sha;  // 64 Zeichen, nul-terminiert
+    const char* path;
+    const char* sha;
 } SdManifestEntry;
 
-// Parst "<64 sha> <size> <pfad>" aus einer (mutierbaren) Zeile. Liefert false
-// bei Formatfehler. sha/pfad werden in-place nul-terminiert.
 static bool sd_update_parse_line(
     char* line, const char** sha, uint64_t* size, const char** path) {
     size_t ll = strlen(line);
@@ -381,12 +355,97 @@ static bool sd_update_parse_line(
     return true;
 }
 
+static bool sd_update_internal_include(const char* rel, bool compact) {
+    // The release contains thousands of individual IRDB remotes below
+    // infrared/assets/<category>/<vendor>/... . Universal remotes use the
+    // consolidated top-level tv.ir/ac.ir/audio.ir/... databases instead, so the
+    // nested packs are the biggest safe win for the 11 MiB internal volume.
+    static const char ir_prefix[] = "infrared/assets/";
+    if(strncmp(rel, ir_prefix, sizeof(ir_prefix) - 1) == 0) {
+        const char* tail = rel + sizeof(ir_prefix) - 1;
+        if(strchr(tail, '/')) return false;
+        // LEDs is useful but comparatively optional; only drop it if the normal
+        // internal profile still does not leave a safe free-space reserve.
+        if(compact && strcmp(tail, "leds.ir") == 0) return false;
+    }
+
+    // Large optional content. The applications remain available and users can
+    // add their own WAD/media later through Web-Filesystem if desired.
+    if(strcmp(rel, "apps_data/doom/doom1.wad") == 0) return false;
+    if(strncmp(rel, "apps_data/medien/", 18) == 0) return false;
+
+    return true;
+}
+
+static uint64_t sd_update_cluster_bytes(uint64_t size) {
+    if(size == 0) return 0;
+    return ((size + SD_UPDATE_INTERNAL_CLUSTER - 1u) / SD_UPDATE_INTERNAL_CLUSTER) *
+           SD_UPDATE_INTERNAL_CLUSTER;
+}
+
+typedef struct {
+    uint64_t total_space;
+    uint64_t free_space;
+    uint64_t additional_bytes;
+    uint32_t files;
+} SdInternalPreflight;
+
+static bool sd_update_internal_preflight(
+    Storage* storage,
+    const char* manifest,
+    bool compact,
+    SdInternalPreflight* out) {
+    memset(out, 0, sizeof(*out));
+    if(storage_common_fs_info(
+           storage, SD_UPDATE_DEST_ROOT, &out->total_space, &out->free_space) != FSE_OK) {
+        return false;
+    }
+
+    const char* cur = manifest;
+    char line[300];
+    while(*cur) {
+        const char* nl = strchr(cur, '\n');
+        size_t ln = nl ? (size_t)(nl - cur) : strlen(cur);
+        if(ln >= sizeof(line)) ln = sizeof(line) - 1;
+        memcpy(line, cur, ln);
+        line[ln] = '\0';
+        cur = nl ? nl + 1 : cur + strlen(cur);
+
+        const char *sha, *rel;
+        uint64_t want_size = 0;
+        if(!sd_update_parse_line(line, &sha, &want_size, &rel)) continue;
+        UNUSED(sha);
+        if(!sd_update_internal_include(rel, compact)) continue;
+
+        char dest[256];
+        if(!sd_update_safe_dest(rel, dest, sizeof(dest))) continue;
+
+        out->files++;
+        uint64_t current_size = 0;
+        FileInfo fi;
+        if(storage_common_stat(storage, dest, &fi) == FSE_OK && !file_info_is_dir(&fi)) {
+            current_size = fi.size;
+        }
+
+        uint64_t want_clusters = sd_update_cluster_bytes(want_size);
+        uint64_t have_clusters = sd_update_cluster_bytes(current_size);
+        if(want_clusters > have_clusters) {
+            out->additional_bytes += want_clusters - have_clusters;
+        }
+    }
+
+    if(out->additional_bytes > out->free_space) return false;
+    if(out->additional_bytes > 0 &&
+       out->free_space - out->additional_bytes < SD_UPDATE_INTERNAL_RESERVE) {
+        return false;
+    }
+    return true;
+}
+
 static int sd_manifest_cmp(const void* a, const void* b) {
     return strcmp(((const SdManifestEntry*)a)->path, ((const SdManifestEntry*)b)->path);
 }
 
-// Lädt /ext/files.txt und baut ein sortiertes Array. *out_buf muss vom Caller
-// freigegeben werden. Liefert false wenn keine lokale Manifest-Datei da ist.
 static bool sd_update_load_local_manifest(
     Storage* storage, char** out_buf, SdManifestEntry** out_entries, uint32_t* out_count) {
     *out_buf = NULL;
@@ -453,22 +512,62 @@ static void sd_update_save_manifest(Storage* storage, const char* data, size_t l
     storage_file_free(f);
 }
 
-// Delta-Sync: vergleicht das (frische) Remote-Manifest mit dem zuletzt
-// gespeicherten lokalen /ext/files.txt; lädt nur neue/geänderte Dateien.
+static void sd_update_mark_internal_profile(Storage* storage, bool compact) {
+    File* f = storage_file_alloc(storage);
+    if(storage_file_open(
+           f, SD_UPDATE_INTERNAL_PROFILE_MARKER, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        const char* value = compact ? "compact-v1\n" : "core-v1\n";
+        storage_file_write(f, value, strlen(value));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+}
+
 static bool sd_update_sync(WlanSdUpdate* u, const char* manifest, size_t mlen) {
-    uint32_t total = sd_update_count_lines(manifest);
     uint32_t done = 0;
-    u->total_files = total;
-    u->done_files = 0;
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(storage, SD_UPDATE_DEST_ROOT);
 
+    u->internal_profile = internal_ext_fallback_is_internal();
+    u->internal_compact = false;
+
+    if(u->internal_profile) {
+        SdInternalPreflight pf;
+        if(!sd_update_internal_preflight(storage, manifest, false, &pf)) {
+            FURI_LOG_W(SD_UPDATE_TAG, "core internal profile does not fit; trying compact");
+            u->internal_compact = true;
+            if(!sd_update_internal_preflight(storage, manifest, true, &pf)) {
+                uint64_t total = 0, free = 0;
+                (void)storage_common_fs_info(storage, SD_UPDATE_DEST_ROOT, &total, &free);
+                char msg[64];
+                snprintf(
+                    msg,
+                    sizeof(msg),
+                    "Internal flash full (%lu KB free)",
+                    (unsigned long)(free / 1024u));
+                sd_update_fail(u, msg);
+                furi_record_close(RECORD_STORAGE);
+                return false;
+            }
+        }
+        u->total_files = pf.files;
+        FURI_LOG_I(
+            SD_UPDATE_TAG,
+            "internal profile=%s files=%lu free=%luKB add=%luKB",
+            u->internal_compact ? "compact" : "core",
+            (unsigned long)pf.files,
+            (unsigned long)(pf.free_space / 1024u),
+            (unsigned long)(pf.additional_bytes / 1024u));
+    } else {
+        u->total_files = sd_update_count_lines(manifest);
+    }
+    u->done_files = 0;
+
     char* lbuf = NULL;
     SdManifestEntry* lentries = NULL;
     uint32_t lcount = 0;
-    bool have_local =
-        sd_update_load_local_manifest(storage, &lbuf, &lentries, &lcount);
+    bool have_local = sd_update_load_local_manifest(storage, &lbuf, &lentries, &lcount);
 
     esp_http_client_config_t cfg;
     sd_update_http_cfg(&cfg, SD_UPDATE_BASE_URL "/files.txt");
@@ -490,13 +589,15 @@ static bool sd_update_sync(WlanSdUpdate* u, const char* manifest, size_t mlen) {
         line[ln] = '\0';
         cur = nl ? nl + 1 : cur + strlen(cur);
 
-        done++;
-        u->done_files = done;
-        u->percent = (uint8_t)((uint64_t)done * 100u / total);
-
         const char *want_sha, *rel;
         uint64_t want_size = 0;
         if(!sd_update_parse_line(line, &want_sha, &want_size, &rel)) continue;
+        if(u->internal_profile && !sd_update_internal_include(rel, u->internal_compact)) continue;
+
+        done++;
+        u->done_files = done;
+        uint32_t total_files = u->total_files ? u->total_files : 1u;
+        u->percent = (uint8_t)((uint64_t)done * 100u / total_files);
 
         char dest[256];
         if(!sd_update_safe_dest(rel, dest, sizeof(dest))) continue;
@@ -506,11 +607,8 @@ static bool sd_update_sync(WlanSdUpdate* u, const char* manifest, size_t mlen) {
         bool exists = storage_common_stat(storage, dest, &fi) == FSE_OK;
         const char* lsha = have_local ? sd_manifest_lookup(lentries, lcount, rel) : NULL;
         if(lsha && exists && strcmp(lsha, want_sha) == 0) {
-            need = false; // laut lokalem Manifest unverändert
-        } else if(!have_local && exists && fi.size == want_size) {
-            // Erstlauf ohne lokales Manifest: vorhandene Datei mit passender
-            // Größe als aktuell annehmen (kein Hashing → schnell). Nach dem
-            // Lauf wird das Manifest persistiert → danach exakter SHA-Diff.
+            need = false;
+        } else if(!have_local && exists && !file_info_is_dir(&fi) && fi.size == want_size) {
             need = false;
         }
 
@@ -539,19 +637,14 @@ static bool sd_update_sync(WlanSdUpdate* u, const char* manifest, size_t mlen) {
     if(lentries) free(lentries);
     if(lbuf) free(lbuf);
 
-    // Nur bei vollständigem Erfolg das Manifest persistieren (sonst beim
-    // nächsten Lauf erneut diffen).
     if(ok && !u->cancel) {
         sd_update_save_manifest(storage, manifest, mlen);
+        if(u->internal_profile) sd_update_mark_internal_profile(storage, u->internal_compact);
     }
 
     furi_record_close(RECORD_STORAGE);
     return ok;
 }
-
-// ---------------------------------------------------------------------------
-// Worker-Task
-// ---------------------------------------------------------------------------
 
 static void sd_update_finish(WlanSdUpdate* u) {
     u->running = false;
@@ -564,8 +657,12 @@ static void sd_update_task(void* arg) {
 
     u->phase = WlanSdUpdateChecking;
     u->percent = 0;
+    u->internal_profile = internal_ext_fallback_is_internal();
 
-    if(!u->cancel && sd_update_is_up_to_date()) {
+    // On internal flash always fetch files.txt and run the delta verifier. A
+    // version.txt-only shortcut can incorrectly call a partially copied volume
+    // up-to-date after an interrupted transfer.
+    if(!u->internal_profile && !u->cancel && sd_update_is_up_to_date()) {
         u->phase = WlanSdUpdateUpToDate;
         sd_update_finish(u);
         return;
@@ -604,10 +701,6 @@ static void sd_update_task(void* arg) {
     sd_update_finish(u);
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 WlanSdUpdate* wlan_sd_update_alloc(void) {
     WlanSdUpdate* u = malloc(sizeof(WlanSdUpdate));
     u->task = NULL;
@@ -618,6 +711,8 @@ WlanSdUpdate* wlan_sd_update_alloc(void) {
     u->speed_kbps = 0;
     u->done_files = 0;
     u->total_files = 0;
+    u->internal_profile = false;
+    u->internal_compact = false;
     u->err[0] = '\0';
     sd_update_set_file(u, "version.txt");
     return u;
@@ -636,8 +731,10 @@ void wlan_sd_update_start(WlanSdUpdate* u) {
     u->speed_kbps = 0;
     u->done_files = 0;
     u->total_files = 0;
+    u->internal_profile = internal_ext_fallback_is_internal();
+    u->internal_compact = false;
     u->err[0] = '\0';
-    sd_update_set_file(u, "version.txt");
+    sd_update_set_file(u, "files.txt");
     u->phase = WlanSdUpdateChecking;
     u->running = true;
     if(xTaskCreate(sd_update_task, "WlanSdUpd", 8192, u, 4, &u->task) != pdPASS) {
