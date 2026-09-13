@@ -1,4 +1,6 @@
 #include "../wlan_app.h"
+#include <internal_ext_fallback.h>
+#include <storage/storage.h>
 
 enum MainIndex {
     MainIndexSelectWifi,
@@ -13,11 +15,21 @@ enum MainIndex {
     MainIndexChannelSmartDeauth = 14,
     MainIndexChannelEvilPortal = 15,
     MainIndexWebFs = 17,
+    MainIndexInternalStorage = 18,
 };
 
 static void wlan_app_scene_main_submenu_cb(void* context, uint32_t index) {
     WlanApp* app = context;
     view_dispatcher_send_custom_event(app->view_dispatcher, index);
+}
+
+static bool wlan_app_internal_storage_ready(void) {
+    if(!internal_ext_fallback_is_internal()) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    bool ready = storage_file_exists(storage, "/ext/Manifest");
+    furi_record_close(RECORD_STORAGE);
+    return ready;
 }
 
 void wlan_app_scene_main_on_enter(void* context) {
@@ -76,6 +88,15 @@ void wlan_app_scene_main_on_enter(void* context) {
         app->submenu, "Web-Filesystem", MainIndexWebFs,
         wlan_app_scene_main_submenu_cb, app);
 
+    if(internal_ext_fallback_is_internal()) {
+        submenu_add_item(
+            app->submenu,
+            wlan_app_internal_storage_ready() ? "Sync Internal Storage" : "Setup Internal Storage",
+            MainIndexInternalStorage,
+            wlan_app_scene_main_submenu_cb,
+            app);
+    }
+
     view_dispatcher_switch_to_view(app->view_dispatcher, WlanAppViewSubmenu);
 }
 
@@ -109,7 +130,7 @@ bool wlan_app_scene_main_on_event(void* context, SceneManagerEvent event) {
             app->connected = false;
             app->target_selected = false;
             app->lan_scan_complete = false;
-            memset(&app->connected_ap, 0, sizeof(app->connected_ap));
+            memset(&app->connected_ap, 0, sizeof(WlanApRecord));
             wlan_app_scene_main_on_exit(app);
             wlan_app_scene_main_on_enter(app);
             consumed = true;
@@ -154,6 +175,17 @@ bool wlan_app_scene_main_on_event(void* context, SceneManagerEvent event) {
                 scene_manager_next_scene(app->scene_manager, WlanAppSceneWebFsInfo);
             } else {
                 scene_manager_next_scene(app->scene_manager, WlanAppSceneWebFsMenu);
+            }
+            consumed = true;
+            break;
+        case MainIndexInternalStorage:
+            // Internal /ext uses the existing SD delta-sync, but never the OTA
+            // firmware phase: this branch intentionally has a single app slot.
+            app->fw_update_flow = true;
+            if(app->connected) {
+                scene_manager_next_scene(app->scene_manager, WlanAppSceneFwUpdate);
+            } else {
+                scene_manager_next_scene(app->scene_manager, WlanAppSceneConnect);
             }
             consumed = true;
             break;
