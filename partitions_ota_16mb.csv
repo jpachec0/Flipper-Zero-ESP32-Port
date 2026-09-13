@@ -9,15 +9,16 @@
 # Recovery remains available through the ESP32-S3 ROM download mode: erase the
 # flash over USB and flash another firmware/partition table at any time.
 #
-# nvs keeps its established offset/size. The application gets 5 MiB (current
-# firmware is ~3.2 MiB), while ext_fat gets 0xAD0000 bytes (~10.8 MiB). The last
-# 128 KiB remain reserved for coredumps.
+# nvs keeps its established offset/size. The application gets 4.5 MiB (current
+# firmware is ~3.2 MiB), while ext_fat gets 0xB50000 bytes (~11.31 MiB raw).
+# The last 128 KiB remain reserved for coredumps. Wear levelling/FAT metadata
+# consumes a small part of ext_fat, so usable capacity is slightly lower.
 #
 # With no OTA app partition esp_ota_get_next_update_partition() returns NULL,
 # so the port's OTA updater reports OTA unsupported instead of touching /ext.
 # ---------------------------------------------------------------------------
 nvs,        data, nvs,       0x9000,    0x6000,
 phy_init,   data, phy,       0xf000,    0x1000,
-factory,    app,  factory,   0x10000,   0x500000,
-ext_fat,    data, fat,       0x510000,  0xAD0000,
+factory,    app,  factory,   0x10000,   0x480000,
+ext_fat,    data, fat,       0x490000,  0xB50000,
 coredump,   data, coredump,  0xFE0000,  0x20000,
