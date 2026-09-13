@@ -3,7 +3,14 @@
 #   waveshare_c6_1.9        - Waveshare ESP32-C6-LCD-1.9 (default, touch input)
 #   waveshare_c6_1.47       - Waveshare ESP32-C6-LCD-1.47 (touch input + IMU)
 #   lilygo_t_embed_cc1101   - LilyGo T-Embed CC1101 (ESP32-S3, encoder input, CC1101/NFC/IR)
-if(NOT DEFINED FLIPPER_BOARD)
+#
+# ESP-IDF evaluates component CMake during dependency discovery in a context
+# where ordinary project variables may be absent. build.sh exports
+# FLIPPER_BOARD, so use that value first to keep discovery and the real build
+# on the same board.
+if(DEFINED ENV{FLIPPER_BOARD} AND NOT "$ENV{FLIPPER_BOARD}" STREQUAL "")
+    set(FLIPPER_BOARD "$ENV{FLIPPER_BOARD}" CACHE STRING "Target board for Flipper ESP32 port" FORCE)
+elseif(NOT DEFINED FLIPPER_BOARD)
     set(FLIPPER_BOARD "waveshare_c6_1.9" CACHE STRING "Target board for Flipper ESP32 port")
 endif()
 message(STATUS "Flipper board: ${FLIPPER_BOARD}")
