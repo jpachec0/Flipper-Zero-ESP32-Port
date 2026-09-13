@@ -6,7 +6,7 @@ App(
     cdefines=["SRV_STORAGE"],
     requires=["storage_settings"],
     provides=["storage_start"],
-    stack_size=3 * 1024,
+    stack_size=8 * 1024,
     order=120,
     sdk_headers=["storage.h"],
 )
