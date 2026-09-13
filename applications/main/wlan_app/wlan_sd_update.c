@@ -356,23 +356,18 @@ static bool sd_update_parse_line(
 }
 
 static bool sd_update_internal_include(const char* rel, bool compact) {
-    // The release contains thousands of individual IRDB remotes below
-    // infrared/assets/<category>/<vendor>/... . Universal remotes use the
-    // consolidated top-level tv.ir/ac.ir/audio.ir/... databases instead, so the
-    // nested packs are the biggest safe win for the 11 MiB internal volume.
     static const char ir_prefix[] = "infrared/assets/";
     if(strncmp(rel, ir_prefix, sizeof(ir_prefix) - 1) == 0) {
         const char* tail = rel + sizeof(ir_prefix) - 1;
         if(strchr(tail, '/')) return false;
-        // LEDs is useful but comparatively optional; only drop it if the normal
-        // internal profile still does not leave a safe free-space reserve.
         if(compact && strcmp(tail, "leds.ir") == 0) return false;
     }
 
     // Large optional content. The applications remain available and users can
     // add their own WAD/media later through Web-Filesystem if desired.
     if(strcmp(rel, "apps_data/doom/doom1.wad") == 0) return false;
-    if(strncmp(rel, "apps_data/medien/", 18) == 0) return false;
+    static const char media_prefix[] = "apps_data/medien/";
+    if(strncmp(rel, media_prefix, sizeof(media_prefix) - 1) == 0) return false;
 
     return true;
 }
@@ -503,12 +498,49 @@ static const char* sd_manifest_lookup(
     return hit ? hit->sha : NULL;
 }
 
-static void sd_update_save_manifest(Storage* storage, const char* data, size_t len) {
+static void sd_update_save_manifest(
+    Storage* storage,
+    const char* data,
+    size_t len,
+    bool internal_profile,
+    bool compact) {
     File* f = storage_file_alloc(storage);
-    if(storage_file_open(f, SD_UPDATE_LOCAL_MANIFEST, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        storage_file_write(f, data, len);
-        storage_file_close(f);
+    if(!storage_file_open(f, SD_UPDATE_LOCAL_MANIFEST, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_free(f);
+        return;
     }
+
+    if(!internal_profile) {
+        storage_file_write(f, data, len);
+    } else {
+        // Persist only the entries that belong to the selected internal profile.
+        // Keeping the full release manifest wastes scarce flash on thousands of
+        // intentionally skipped IRDB paths and makes the local SHA index lie about
+        // what this device is expected to carry.
+        const char* cur = data;
+        char parsed[300];
+        while(*cur) {
+            const char* nl = strchr(cur, '\n');
+            size_t raw_len = nl ? (size_t)(nl - cur) : strlen(cur);
+            size_t parse_len = raw_len < sizeof(parsed) - 1 ? raw_len : sizeof(parsed) - 1;
+            memcpy(parsed, cur, parse_len);
+            parsed[parse_len] = '\0';
+
+            const char *sha, *rel;
+            uint64_t ignored_size = 0;
+            if(sd_update_parse_line(parsed, &sha, &ignored_size, &rel) &&
+               sd_update_internal_include(rel, compact)) {
+                UNUSED(sha);
+                UNUSED(ignored_size);
+                storage_file_write(f, cur, raw_len);
+                storage_file_write(f, "\n", 1);
+            }
+
+            cur = nl ? nl + 1 : cur + raw_len;
+        }
+    }
+
+    storage_file_close(f);
     storage_file_free(f);
 }
 
@@ -638,7 +670,8 @@ static bool sd_update_sync(WlanSdUpdate* u, const char* manifest, size_t mlen) {
     if(lbuf) free(lbuf);
 
     if(ok && !u->cancel) {
-        sd_update_save_manifest(storage, manifest, mlen);
+        sd_update_save_manifest(
+            storage, manifest, mlen, u->internal_profile, u->internal_compact);
         if(u->internal_profile) sd_update_mark_internal_profile(storage, u->internal_compact);
     }
 
