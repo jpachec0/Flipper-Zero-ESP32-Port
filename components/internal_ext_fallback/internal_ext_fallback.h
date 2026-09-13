@@ -1,29 +1,27 @@
 #pragma once
 
 #include <stdbool.h>
-#include <stdint.h>
 #include <furi_hal_sd.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** Mount external SD when available, otherwise mount the internal FATFS
- * partition at the same VFS path used by storage (/sdcard).
+/** Initialize the physical SD card when possible. If SD initialization fails,
+ * register the internal wear-levelled FAT partition as FatFs drive 0 instead.
  */
-bool internal_ext_fallback_mount(void);
+FuriStatus internal_ext_fallback_init(bool power_reset);
 
-/** Unmount whichever backend currently serves /ext. */
-bool internal_ext_fallback_unmount(void);
+/** Storage-facing presence check. The internal FAT partition keeps /ext
+ * logically present even when no physical microSD can be initialized.
+ */
+bool internal_ext_fallback_is_present(void);
 
-/** Return true when either SD or the internal FATFS fallback is mounted. */
-bool internal_ext_fallback_is_mounted(void);
-
-/** Return true when /ext is currently backed by internal flash. */
-bool internal_ext_fallback_is_internal(void);
-
-/** Fill SD-compatible geometry/capacity information for the active backend. */
+/** Fill SD-compatible information for whichever backend currently serves /ext. */
 FuriStatus internal_ext_fallback_info(FuriHalSdInfo* info);
+
+/** True once this boot has switched /ext to the internal flash backend. */
+bool internal_ext_fallback_is_internal(void);
 
 #ifdef __cplusplus
 }
