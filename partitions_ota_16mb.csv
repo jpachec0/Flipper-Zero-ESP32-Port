@@ -1,27 +1,23 @@
 # Name,   Type, SubType,   Offset,    Size,      Flags
 # ---------------------------------------------------------------------------
-# Dual-OTA layout for 16 MB flash boards (LilyGo T-Embed CC1101).
+# Internal-/ext layout for 16 MB flash boards (LilyGo T-Embed CC1101).
 #
-#   ota_0 / ota_1 = two app slots for self-update (WiFi app "Update" menu).
-#                   The running slot flashes the downloaded furi_esp32.bin into
-#                   the other (inactive) slot via esp_ota_write, then reboots.
-#   otadata       = which slot to boot (managed by esp_ota_set_boot_partition).
-#   ext_fat       = internal FATFS /ext fallback when no microSD is mountable.
-#                   Mounted with wear levelling at the same /sdcard VFS path.
+# This feature branch intentionally uses a single factory app slot instead of
+# dual OTA. The released flash space becomes a large FATFS volume used as the
+# transparent /ext fallback when no microSD can be mounted.
 #
-# nvs keeps the exact offset/size of the former single-app table (0x9000 /
-# 0x6000) so existing NVS data (settings, BT bonds) survives the switch.
+# Recovery remains available through the ESP32-S3 ROM download mode: erase the
+# flash over USB and flash another firmware/partition table at any time.
 #
-# Bootloader occupies 0x0..0x8000 on the ESP32-S3, the partition table lives at
-# 0x8000 (CONFIG_PARTITION_TABLE_OFFSET); the first partition follows at 0x9000.
-# App partitions must be 64 KB aligned, so ota_0 lands at 0x10000 and ota_1 at
-# 0x600000. otadata sits behind the app slots to avoid moving nvs/phy_init.
-# Each app slot is ~6.1 MB; the built app is ~3.2 MB (plenty of headroom).
+# nvs keeps its established offset/size. The application gets 5 MiB (current
+# firmware is ~3.2 MiB), while ext_fat gets 0xAD0000 bytes (~10.8 MiB). The last
+# 128 KiB remain reserved for coredumps.
+#
+# With no OTA app partition esp_ota_get_next_update_partition() returns NULL,
+# so the port's OTA updater reports OTA unsupported instead of touching /ext.
 # ---------------------------------------------------------------------------
 nvs,        data, nvs,       0x9000,    0x6000,
 phy_init,   data, phy,       0xf000,    0x1000,
-ota_0,      app,  ota_0,     0x10000,   0x5F0000,
-ota_1,      app,  ota_1,     0x600000,  0x5F0000,
-otadata,    data, ota,       0xBF0000,  0x2000,
-coredump,   data, coredump,  0xBF2000,  0x20000,
-ext_fat,    data, fat,       0xC12000,  0x3E0000,
+factory,    app,  factory,   0x10000,   0x500000,
+ext_fat,    data, fat,       0x510000,  0xAD0000,
+coredump,   data, coredump,  0xFE0000,  0x20000,
