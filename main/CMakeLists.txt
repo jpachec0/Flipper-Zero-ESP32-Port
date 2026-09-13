@@ -79,6 +79,7 @@ if(NOT CMAKE_SCRIPT_MODE_FILE)
         idf::mjs
         idf::libsmb2
         idf::mbedtls
+        idf::internal_ext_fallback
     )
 
     foreach(esp32_fam_target IN LISTS ESP32_FAM_PORTED_OBJECT_TARGETS)
