@@ -6,7 +6,13 @@ set(ESP32_FAM_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(ESP32_FAM_REGISTRY_C "${ESP32_FAM_GENERATED_DIR}/applications.c")
 set(ESP32_FAM_PORTED_CMAKE "${ESP32_FAM_GENERATED_DIR}/ported_apps.cmake")
 
-if(NOT DEFINED FLIPPER_BOARD)
+# ESP-IDF evaluates component CMake files during a dependency-discovery pass
+# where regular project variables are not always propagated. build.sh exports
+# FLIPPER_BOARD specifically for that pass, so prefer the environment value
+# before falling back to the historical Waveshare default.
+if(DEFINED ENV{FLIPPER_BOARD} AND NOT "$ENV{FLIPPER_BOARD}" STREQUAL "")
+    set(FLIPPER_BOARD "$ENV{FLIPPER_BOARD}")
+elseif(NOT DEFINED FLIPPER_BOARD)
     set(FLIPPER_BOARD "waveshare_c6_1.9")
 endif()
 
