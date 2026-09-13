@@ -32,8 +32,14 @@ static void internal_ext_release_flash(void) {
 }
 
 static bool internal_ext_prepare_filesystem(void) {
-    FATFS probe_fs;
-    FRESULT result = f_mount(&probe_fs, INTERNAL_EXT_DRIVE, 1);
+    bool ok = false;
+    FATFS* probe_fs = calloc(1, sizeof(*probe_fs));
+    if(!probe_fs) {
+        ESP_LOGE(TAG, "Unable to allocate temporary FATFS object");
+        return false;
+    }
+
+    FRESULT result = f_mount(probe_fs, INTERNAL_EXT_DRIVE, 1);
 
     if(result == FR_NO_FILESYSTEM || result == FR_INT_ERR) {
         ESP_LOGW(TAG, "Internal /ext has no FAT filesystem; formatting once");
@@ -41,7 +47,7 @@ static bool internal_ext_prepare_filesystem(void) {
         void* workbuf = malloc(INTERNAL_EXT_WORKBUF_SIZE);
         if(!workbuf) {
             ESP_LOGE(TAG, "Unable to allocate FAT format work buffer");
-            return false;
+            goto cleanup;
         }
 
         const MKFS_PARM options = {
@@ -57,13 +63,13 @@ static bool internal_ext_prepare_filesystem(void) {
 
         if(result != FR_OK) {
             ESP_LOGE(TAG, "Formatting internal /ext failed: %d", result);
-            return false;
+            goto cleanup;
         }
 
-        result = f_mount(&probe_fs, INTERNAL_EXT_DRIVE, 1);
+        result = f_mount(probe_fs, INTERNAL_EXT_DRIVE, 1);
         if(result != FR_OK) {
             ESP_LOGE(TAG, "Mount after internal /ext format failed: %d", result);
-            return false;
+            goto cleanup;
         }
 
         (void)f_setlabel("Flipper INT");
@@ -71,16 +77,19 @@ static bool internal_ext_prepare_filesystem(void) {
 
     if(result != FR_OK) {
         ESP_LOGE(TAG, "Internal /ext FAT probe failed: %d", result);
-        return false;
+        goto cleanup;
     }
 
+    ok = true;
+
+cleanup:
     result = f_mount(NULL, INTERNAL_EXT_DRIVE, 0);
     if(result != FR_OK) {
         ESP_LOGE(TAG, "Internal /ext FAT probe unmount failed: %d", result);
-        return false;
+        ok = false;
     }
-
-    return true;
+    free(probe_fs);
+    return ok;
 }
 
 static bool internal_ext_activate_flash(void) {
