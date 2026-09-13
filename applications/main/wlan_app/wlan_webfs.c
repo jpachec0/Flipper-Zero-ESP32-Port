@@ -5,6 +5,7 @@
 #include <storage/storage.h>
 #include <toolbox/stream/file_stream.h>
 #include <btshim.h>
+#include <internal_ext_fallback.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -20,6 +21,43 @@
 #define WEBFS_CONFIG     "/ext/webfs/config.txt"
 #define WEBFS_INDEX_PATH "/ext/webfs/index.html"
 #define WEBFS_IO_CHUNK   4096
+
+/* Built into the firmware so a freshly formatted /ext is immediately usable.
+ * If /ext/webfs/index.html exists, that richer external UI still wins. */
+static const char WEBFS_BOOTSTRAP_HTML[] =
+    "<!doctype html><html><head><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>Web-Filesystem</title><style>"
+    "body{font-family:system-ui,sans-serif;max-width:760px;margin:32px auto;padding:0 16px;background:#111;color:#eee}"
+    "button,input{font:inherit;margin:6px 0}button{padding:9px 14px}input{display:block}"
+    "code,pre{background:#222;padding:4px 6px;border-radius:5px}pre{white-space:pre-wrap;min-height:72px}"
+    "progress{width:100%;height:20px}.muted{color:#aaa}.warn{color:#ffbf69}</style></head><body>"
+    "<h2>Web-Filesystem</h2>"
+    "<p id=storage class=muted>Reading storage...</p>"
+    "<p>This is the built-in bootstrap uploader. Select the <b>extracted folder</b>; its top-level folder name is stripped and the contents are written directly to <code>/ext</code>.</p>"
+    "<p id=hint class=warn></p>"
+    "<h3>Upload folder</h3><input id=folder type=file webkitdirectory multiple>"
+    "<button onclick=sendFolder()>Upload folder to /ext</button>"
+    "<h3>Upload files</h3><input id=files type=file multiple>"
+    "<button onclick=sendFiles()>Upload files to /ext</button>"
+    "<progress id=bar value=0 max=100></progress><pre id=log>Ready.</pre>"
+    "<script>"
+    "const $=x=>document.getElementById(x);let si={total:0,free:0,internal:false};"
+    "const mb=n=>(n/1048576).toFixed(2)+' MiB';"
+    "async function refresh(){try{si=await fetch('/api/info').then(r=>r.json());"
+    "$('storage').textContent=(si.internal?'Internal flash /ext':'External SD /ext')+' — '+mb(si.free)+' free of '+mb(si.total);"
+    "$('hint').textContent=si.internal?'The full official sdcard pack may be larger than internal flash. Prefer WiFi > Setup Internal Storage on the device for the automatic compact profile.':'';}catch(e){$('storage').textContent='Storage info unavailable';}}"
+    "async function mkdir(p){let r=await fetch('/api/mkdir?path='+encodeURIComponent(p),{method:'POST'});if(!r.ok)throw Error('mkdir '+p+': '+await r.text());}"
+    "function commonRoot(fs){let a=fs.map(f=>(f.webkitRelativePath||'').split('/')[0]).filter(Boolean);return a.length&&a.every(x=>x===a[0])?a[0]+'/':'';}"
+    "async function upload(fs,strip){fs=[...fs];if(!fs.length)return;$('bar').value=0;await refresh();"
+    "let estimate=fs.reduce((n,f)=>n+Math.ceil(Math.max(1,f.size)/4096)*4096,0);"
+    "if(si.internal&&estimate+262144>si.free){$('log').textContent='Selection needs about '+mb(estimate)+' but only '+mb(si.free)+' is free. Nothing was written. Use Setup Internal Storage on the device or choose a smaller folder.';return;}"
+    "let root=strip?commonRoot(fs):'';let done=0;for(let f of fs){let rel=f.webkitRelativePath||f.name;if(root&&rel.startsWith(root))rel=rel.slice(root.length);if(!rel)continue;let remote='/ext/'+rel;"
+    "$('log').textContent='Uploading '+remote+'\n'+done+'/'+fs.length;let r=await fetch('/api/upload?path='+encodeURIComponent(remote),{method:'POST',body:f});if(!r.ok){$('log').textContent+='\nFAILED: '+await r.text();return;}done++;$('bar').value=done*100/fs.length;}"
+    "$('log').textContent='Done: '+done+' files uploaded. You can reboot the device now.';await refresh();}"
+    "function sendFolder(){upload($('folder').files,true).catch(e=>$('log').textContent='Error: '+e.message)}"
+    "function sendFiles(){upload($('files').files,false).catch(e=>$('log').textContent='Error: '+e.message)}"
+    "refresh();</script></body></html>";
 
 /* ─────────────────────── state ─────────────────────── */
 
@@ -88,7 +126,6 @@ static int hex_val(char c) {
     return -1;
 }
 
-/* %XX decode only; '+' stays literal (the UI uses encodeURIComponent). */
 static void url_decode(const char* in, char* out, size_t out_max) {
     size_t o = 0;
     for(size_t i = 0; in[i] && o + 1 < out_max;) {
@@ -105,7 +142,6 @@ static void url_decode(const char* in, char* out, size_t out_max) {
     out[o] = '\0';
 }
 
-/* Escape ", \ and control chars for a JSON string. */
 static void json_escape(char* out, size_t out_size, const char* in) {
     size_t o = 0;
     for(size_t i = 0; in[i] && o + 7 < out_size; i++) {
@@ -148,12 +184,24 @@ static bool get_query_param(httpd_req_t* req, const char* key, char* out, size_t
     return ok;
 }
 
-/* Confine access to /ext (or /ext/...), reject ".." traversal. */
 static bool path_ok(const char* p) {
     if(strncmp(p, "/ext", 4) != 0) return false;
     if(p[4] != '\0' && p[4] != '/') return false;
     if(strstr(p, "..")) return false;
     return true;
+}
+
+static void webfs_mkdir_parents(Storage* storage, const char* path) {
+    char tmp[256];
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    for(char* p = tmp + 1; *p; ++p) {
+        if(*p == '/') {
+            *p = '\0';
+            if(strcmp(tmp, "/ext") != 0) (void)storage_common_mkdir(storage, tmp);
+            *p = '/';
+        }
+    }
 }
 
 /* ─────────────────────── HTTP handlers ─────────────────────── */
@@ -162,6 +210,7 @@ static esp_err_t handler_root(httpd_req_t* req) {
     Storage* st = furi_record_open(RECORD_STORAGE);
     File* f = storage_file_alloc(st);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     if(storage_file_open(f, WEBFS_INDEX_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
         uint8_t* buf = malloc(WEBFS_IO_CHUNK);
         if(buf) {
@@ -174,14 +223,34 @@ static esp_err_t handler_root(httpd_req_t* req) {
         httpd_resp_send_chunk(req, NULL, 0);
         storage_file_close(f);
     } else {
-        FURI_LOG_W(TAG, "index.html NOT found on SD");
-        httpd_resp_sendstr(
-            req,
-            "<!doctype html><meta charset=utf-8><h2>Web-Filesystem</h2>"
-            "<p>Place <code>/ext/webfs/index.html</code> on the SD card.</p>");
+        FURI_LOG_I(TAG, "external index absent; serving built-in bootstrap UI");
+        httpd_resp_send(req, WEBFS_BOOTSTRAP_HTML, HTTPD_RESP_USE_STRLEN);
     }
     storage_file_free(f);
     furi_record_close(RECORD_STORAGE);
+    return ESP_OK;
+}
+
+static esp_err_t handler_info(httpd_req_t* req) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    uint64_t total = 0, free = 0;
+    FS_Error e = storage_common_fs_info(st, "/ext", &total, &free);
+    furi_record_close(RECORD_STORAGE);
+    if(e != FSE_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fs info failed");
+        return ESP_OK;
+    }
+
+    char body[160];
+    int n = snprintf(
+        body,
+        sizeof(body),
+        "{\"total\":%llu,\"free\":%llu,\"internal\":%s}",
+        (unsigned long long)total,
+        (unsigned long long)free,
+        internal_ext_fallback_is_internal() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, n);
     return ESP_OK;
 }
 
@@ -278,12 +347,30 @@ static esp_err_t handler_download(httpd_req_t* req) {
 
 static esp_err_t handler_upload(httpd_req_t* req) {
     char path[256];
-    if(!get_query_param(req, "path", path, sizeof(path)) || !path_ok(path)) {
+    if(!get_query_param(req, "path", path, sizeof(path)) || !path_ok(path) ||
+       strcmp(path, "/ext") == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path");
         return ESP_OK;
     }
 
     Storage* st = furi_record_open(RECORD_STORAGE);
+
+    // Refuse an upload before truncating an existing file if it cannot fit.
+    // This prevents the half-written files we observed when the internal FAT
+    // volume filled in the middle of a recursive upload.
+    uint64_t total = 0, free = 0, reclaim = 0;
+    FileInfo old_info;
+    if(storage_common_stat(st, path, &old_info) == FSE_OK && !file_info_is_dir(&old_info)) {
+        reclaim = old_info.size;
+    }
+    if(storage_common_fs_info(st, "/ext", &total, &free) == FSE_OK &&
+       (uint64_t)req->content_len > free + reclaim) {
+        furi_record_close(RECORD_STORAGE);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "not enough space");
+        return ESP_OK;
+    }
+
+    webfs_mkdir_parents(st, path);
     File* f = storage_file_alloc(st);
     if(!storage_file_open(f, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         storage_file_free(f);
@@ -382,8 +469,6 @@ static bool start_http(void) {
     if(s_http) return true;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    /* 6144 stack: the handlers use ~2 KB of local buffers; 4096 overflows the
-     * httpd task and the request hangs. */
     config.stack_size = 6144;
     config.max_uri_handlers = 12;
     config.max_open_sockets = 3;
@@ -397,6 +482,7 @@ static bool start_http(void) {
 
     static const httpd_uri_t uris[] = {
         {.uri = "/", .method = HTTP_GET, .handler = handler_root},
+        {.uri = "/api/info", .method = HTTP_GET, .handler = handler_info},
         {.uri = "/api/list", .method = HTTP_GET, .handler = handler_list},
         {.uri = "/api/download", .method = HTTP_GET, .handler = handler_download},
         {.uri = "/api/upload", .method = HTTP_POST, .handler = handler_upload},
@@ -574,7 +660,6 @@ bool wlan_webfs_start_ap(const char* ssid, const char* password) {
     if(s_running) return true;
     if(!ssid || !ssid[0]) return false;
 
-    /* Take over the radio: stop STA + BLE. */
     if(wlan_hal_is_started()) {
         wlan_hal_stop();
     }
@@ -599,7 +684,6 @@ bool wlan_webfs_start_sta(void) {
     if(s_running) return true;
     if(!wlan_hal_is_connected()) return false;
 
-    /* Radio + BLE are already owned by wlan_hal; only start the server. */
     StaArgs sa = {.result = false};
     if(!wlan_hal_run_in_worker(webfs_sta_worker, &sa)) return false;
     if(sa.result) {
@@ -621,9 +705,6 @@ void wlan_webfs_stop(void) {
     if(!s_running) return;
 
     if(s_is_ap) {
-        /* Fully tear down httpd + WiFi FIRST so the (large) BLE stack has room to
-         * come back — restoring BLE while WiFi/httpd still hold internal DRAM can
-         * OOM the Bluedroid workqueue and panic. */
         wlan_hal_run_in_worker(webfs_ap_stop_worker, NULL);
         if(s_bt_was_on) {
             Bt* bt = furi_record_open(RECORD_BT);
@@ -632,7 +713,6 @@ void wlan_webfs_stop(void) {
             s_bt_was_on = false;
         }
     } else {
-        /* STA mode: leave the wlan_hal connection + BLE alone, just stop httpd. */
         wlan_hal_run_in_worker(webfs_http_stop_worker, NULL);
     }
 }
