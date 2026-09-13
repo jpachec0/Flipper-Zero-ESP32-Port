@@ -1,6 +1,7 @@
 #include "../wlan_app.h"
 #include "../wlan_fw_update.h"
 #include "../wlan_sd_update.h"
+#include <internal_ext_fallback.h>
 
 #include <esp_system.h> // esp_restart
 
@@ -10,6 +11,10 @@
 // nur, wenn KEIN FW-Update ansteht (bzw. der User es überspringt); nach einem
 // FW-Flash+Reboot erreicht der nächste "Update"-Aufruf direkt die SD-Phase,
 // weil die FW dann als aktuell erkannt wird (Marker /ext/.fw_version).
+//
+// Beim internen /ext-Fallback gibt es absichtlich keinen OTA-Slot. In diesem
+// Modus wird die Firmware-Phase vollständig übersprungen und derselbe Flow als
+// "Setup/Sync Internal Storage" für das kapazitätsadaptierte Asset-Profil genutzt.
 
 typedef enum {
     UpdCheckingFw = 0,
@@ -152,8 +157,20 @@ static void upd_show_confirm_fw_install(WlanApp* app) {
 
 static void upd_show_uptodate(WlanApp* app) {
     popup_reset(app->popup);
-    popup_set_header(app->popup, "Update", 64, 10, AlignCenter, AlignTop);
-    popup_set_text(app->popup, "Already up-to-date", 64, 36, AlignCenter, AlignCenter);
+    popup_set_header(
+        app->popup,
+        internal_ext_fallback_is_internal() ? "Internal storage" : "Update",
+        64,
+        10,
+        AlignCenter,
+        AlignTop);
+    popup_set_text(
+        app->popup,
+        internal_ext_fallback_is_internal() ? "Starter files ready" : "Already up-to-date",
+        64,
+        36,
+        AlignCenter,
+        AlignCenter);
     popup_set_context(app->popup, app);
     popup_set_callback(app->popup, upd_info_popup_cb);
     popup_set_timeout(app->popup, UPD_INFO_POPUP_MS);
@@ -163,8 +180,20 @@ static void upd_show_uptodate(WlanApp* app) {
 
 static void upd_show_sd_done(WlanApp* app) {
     popup_reset(app->popup);
-    popup_set_header(app->popup, "Update", 64, 10, AlignCenter, AlignTop);
-    popup_set_text(app->popup, "Done!", 64, 36, AlignCenter, AlignCenter);
+    popup_set_header(
+        app->popup,
+        internal_ext_fallback_is_internal() ? "Internal storage" : "Update",
+        64,
+        10,
+        AlignCenter,
+        AlignTop);
+    popup_set_text(
+        app->popup,
+        internal_ext_fallback_is_internal() ? "Starter files ready" : "Done!",
+        64,
+        36,
+        AlignCenter,
+        AlignCenter);
     popup_set_context(app->popup, app);
     popup_set_callback(app->popup, upd_info_popup_cb);
     popup_set_timeout(app->popup, UPD_INFO_POPUP_MS);
@@ -186,7 +215,13 @@ static void upd_show_fw_reboot(WlanApp* app) {
 static void upd_show_error(WlanApp* app, const char* msg) {
     widget_reset(app->widget);
     widget_add_string_element(
-        app->widget, 64, 16, AlignCenter, AlignBottom, FontPrimary, "Update failed");
+        app->widget,
+        64,
+        16,
+        AlignCenter,
+        AlignBottom,
+        FontPrimary,
+        internal_ext_fallback_is_internal() ? "Storage setup failed" : "Update failed");
     widget_add_text_box_element(
         app->widget, 0, 22, 128, 26, AlignCenter, AlignTop, msg, false);
     widget_add_button_element(app->widget, GuiButtonTypeRight, "OK", upd_error_ok_cb, app);
@@ -197,7 +232,9 @@ static void upd_show_error(WlanApp* app, const char* msg) {
 static void upd_start_sd(WlanApp* app) {
     upd_set_state(app, UpdSdRunning);
     wlan_sd_update_start(app->sd_update);
-    upd_show_sd_progress(app, "Checking Version");
+    upd_show_sd_progress(
+        app,
+        internal_ext_fallback_is_internal() ? "Preparing Storage" : "Checking Version");
 }
 
 // --- Scene handlers --------------------------------------------------------
@@ -205,6 +242,14 @@ static void upd_start_sd(WlanApp* app) {
 void wlan_app_scene_fw_update_on_enter(void* context) {
     WlanApp* app = context;
     app->fw_update_flow = false; // Flow erreicht → Flag konsumiert
+
+    if(internal_ext_fallback_is_internal()) {
+        // Single-app/internal-ext layout: OTA cannot be safe because there is no
+        // inactive application slot. Provision the compact /ext profile directly.
+        upd_start_sd(app);
+        return;
+    }
+
     upd_set_state(app, UpdCheckingFw);
     wlan_fw_update_check_start(app->fw_update);
     upd_show_fw_progress(app, "Checking Firmware");
@@ -280,9 +325,13 @@ bool wlan_app_scene_fw_update_on_event(void* context, SceneManagerEvent event) {
         } else if(st == UpdSdRunning) {
             WlanSdUpdatePhase ph = wlan_sd_update_get_phase(app->sd_update);
             if(ph == WlanSdUpdateChecking) {
-                upd_show_sd_progress(app, "Checking Version");
+                upd_show_sd_progress(
+                    app,
+                    internal_ext_fallback_is_internal() ? "Preparing Storage" : "Checking Version");
             } else if(ph == WlanSdUpdateDownloading || ph == WlanSdUpdateExtracting) {
-                upd_show_sd_progress(app, "Sync Files");
+                upd_show_sd_progress(
+                    app,
+                    internal_ext_fallback_is_internal() ? "Installing Files" : "Sync Files");
             } else if(ph == WlanSdUpdateUpToDate) {
                 upd_set_state(app, UpdSdInfo);
                 upd_show_uptodate(app);
