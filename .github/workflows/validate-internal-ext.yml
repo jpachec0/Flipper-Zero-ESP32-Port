@@ -62,13 +62,17 @@ jobs:
           source ~/esp/esp-idf/export.sh
           bash ./build.sh --board t_embed --build-only
 
-      - name: Verify internal ext partition
+      - name: Verify internal ext partition and image size
         run: |
           grep -q '^ext_fat' partitions_ota_16mb.csv
-          grep -q '0x510000,  0xAD0000' partitions_ota_16mb.csv
+          grep -q '0x490000,  0xB50000' partitions_ota_16mb.csv
           test -f build_t_embed/furi_esp32.bin
           test -f build_t_embed/bootloader/bootloader.bin
           test -f build_t_embed/partition_table/partition-table.bin
+          APP_SIZE=$(stat -c%s build_t_embed/furi_esp32.bin)
+          APP_LIMIT=$((0x480000))
+          echo "App image: ${APP_SIZE} bytes / ${APP_LIMIT} bytes partition"
+          test "${APP_SIZE}" -lt "${APP_LIMIT}"
 
       - name: Stage flash package
         run: |
