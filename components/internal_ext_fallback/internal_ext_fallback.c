@@ -86,8 +86,8 @@ FuriStatus internal_ext_fallback_info(FuriHalSdInfo* info) {
         return furi_hal_sd_info(info);
     }
 
-    size_t total_bytes = 0;
-    size_t free_bytes = 0;
+    uint64_t total_bytes = 0;
+    uint64_t free_bytes = 0;
     esp_err_t err = esp_vfs_fat_info(EXT_VFS_PATH, &total_bytes, &free_bytes);
     if(err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to query internal /ext FATFS: %s", esp_err_to_name(err));
