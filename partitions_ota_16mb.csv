@@ -6,6 +6,8 @@
 #                   The running slot flashes the downloaded furi_esp32.bin into
 #                   the other (inactive) slot via esp_ota_write, then reboots.
 #   otadata       = which slot to boot (managed by esp_ota_set_boot_partition).
+#   ext_fat       = internal FATFS /ext fallback when no microSD is mountable.
+#                   Mounted with wear levelling at the same /sdcard VFS path.
 #
 # nvs keeps the exact offset/size of the former single-app table (0x9000 /
 # 0x6000) so existing NVS data (settings, BT bonds) survives the switch.
@@ -22,3 +24,4 @@ ota_0,      app,  ota_0,     0x10000,   0x5F0000,
 ota_1,      app,  ota_1,     0x600000,  0x5F0000,
 otadata,    data, ota,       0xBF0000,  0x2000,
 coredump,   data, coredump,  0xBF2000,  0x20000,
+ext_fat,    data, fat,       0xC12000,  0x3E0000,
