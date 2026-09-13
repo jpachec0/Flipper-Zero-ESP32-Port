@@ -1,6 +1,9 @@
 # Name,   Type, SubType, Offset,  Size, Flags
 # Local override for the ESP32 port: the ported Flipper image is already
 # significantly larger than ESP-IDF's stock "singleapp_large" layout.
+# The final FAT partition provides a persistent internal /ext fallback when
+# an external SD card is absent or cannot be mounted.
 nvs,      data, nvs,     ,        0x6000,
 phy_init, data, phy,     ,        0x1000,
 factory,  app,  factory, ,        0x600000,
+ext_fat,  data, fat,     ,        0x1E0000,
