@@ -32,7 +32,7 @@ endif()
 idf_component_register(
     SRCS "app_main.c" "${ESP32_FAM_REGISTRY_C}"
     INCLUDE_DIRS "."
-    REQUIRES furi furi_hal input notification gui locale storage loader desktop btshim wifi app_update fw_ota libsmb2
+    REQUIRES furi furi_hal input notification gui locale storage loader desktop btshim wifi app_update fw_ota libsmb2 internal_ext_fallback
     LDFRAGMENTS "main.lf"
 )
 
@@ -101,6 +101,20 @@ if(NOT CMAKE_SCRIPT_MODE_FILE)
         )
         target_sources(${COMPONENT_LIB} PRIVATE $<TARGET_OBJECTS:${esp32_fam_target}>)
     endforeach()
+
+    # The storage service is the owner of Flipper's /ext namespace. Route only
+    # its SD-facing probes through the backend selector: physical microSD wins,
+    # while the internal wear-levelled FAT partition becomes drive 0 if SD init
+    # fails. Other users of furi_hal_sd_* (notably raw USB MSC) remain physical
+    # SD only.
+    if(TARGET esp32_fam_app_storage)
+        target_link_libraries(esp32_fam_app_storage PRIVATE idf::internal_ext_fallback)
+        target_compile_definitions(esp32_fam_app_storage PRIVATE
+            furi_hal_sd_init=internal_ext_fallback_init
+            furi_hal_sd_is_present=internal_ext_fallback_is_present
+            furi_hal_sd_info=internal_ext_fallback_info
+        )
+    endif()
 
     # The Streaming app bundles former-FAP media modules (airplay_raop,
     # dlna_render, cast_client, ...) that were built with relaxed warnings as
