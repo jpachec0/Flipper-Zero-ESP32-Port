@@ -88,8 +88,10 @@ BOARD="${NAMES[$SELECTED_BOARD]}"
 BUILD_DIR="${DIRS[$SELECTED_BOARD]}"
 TARGET="${TARGETS[$SELECTED_BOARD]}"
 
-# Force environment to match board target
+# Force both ESP-IDF and the port's FAM/board selection to match from the very
+# first CMake configure performed by `idf.py set-target`.
 export IDF_TARGET="${TARGET}"
+export FLIPPER_BOARD="${BOARD}"
 
 if [[ -z "${PORT}" && "${BUILD_ONLY}" -eq 0 ]]; then
     PORT="$(detect_port || echo "")"
@@ -128,8 +130,9 @@ if [[ -f "sdkconfig.defaults.${BOARD}" ]]; then
     BOARD_DEFAULTS_OPTS=("-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.${BOARD}")
 fi
 
-# Set target (creates/updates sdkconfig)
-idf.py -B "${BUILD_DIR}" "${BOARD_DEFAULTS_OPTS[@]}" set-target "${TARGET}"
+# Set target (creates/updates sdkconfig). Pass FLIPPER_BOARD here too; without
+# this first configure the furi_hal component falls back to Waveshare C6.
+idf.py -B "${BUILD_DIR}" -DFLIPPER_BOARD="${BOARD}" "${BOARD_DEFAULTS_OPTS[@]}" set-target "${TARGET}"
 
 # Construct command
 COMMANDS=("reconfigure" "build")
